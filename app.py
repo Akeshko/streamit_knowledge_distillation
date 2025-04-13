@@ -7,6 +7,7 @@ from torchvision import models
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 from streamlit_autorefresh import st_autorefresh
 import av
+from PIL import Image
 
 # ------------------- Setup -------------------
 st.set_page_config(page_title="CelebA ResNet18", layout="centered")
@@ -23,14 +24,16 @@ celeba_attrs = [
     "Sideburns", "Smiling", "Straight_Hair", "Wavy_Hair", "Wearing_Earrings",
     "Wearing_Hat", "Wearing_Lipstick", "Wearing_Necklace", "Wearing_Necktie", "Young"
 ]
-if "prev_top_k" not in st.session_state:
-    st.session_state.prev_top_k=3
-# Top-k selector
-top_k = st.selectbox("Top attributes to show", [1, 3, 5, 10], index=1)
 
-if top_k!=st.session_state.prev_top_k:
-    st.session_state.prev_top_k =top_k
-    st.rerun()
+# ------------------- Session State Setup -------------------
+if "top_k" not in st.session_state:
+    st.session_state.top_k = 3
+
+st.session_state.top_k = st.selectbox(
+    "Top attributes to show", [1, 3, 5, 10],
+    index=[1, 3, 5, 10].index(st.session_state.top_k)
+)
+top_k = st.session_state.top_k
 
 # ------------------- Load Models -------------------
 @st.cache_resource
@@ -58,51 +61,85 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# ------------------- Video Processor -------------------
-class VideoProcessor(VideoProcessorBase):
-    def _init_(self):
-        self.pred1 = []
-        self.pred2 = []
+# ------------------- Inference Function -------------------
+def predict_attributes(image):
+    image = np.array(image.convert("RGB"))
+    input_tensor = transform(image).unsqueeze(0)
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        input_tensor = transform(img_rgb).unsqueeze(0)
+    with torch.no_grad():
+        out1 = torch.sigmoid(model1(input_tensor))[0]
+        out2 = torch.sigmoid(model2(input_tensor))[0]
 
-        with torch.no_grad():
-            out1 = torch.sigmoid(model1(input_tensor))[0]
-            out2 = torch.sigmoid(model2(input_tensor))[0]
+    top1 = torch.topk(out1, top_k)
+    top2 = torch.topk(out2, top_k)
 
-        k =  getattr(self,"top_k",3)
-        top1= torch.topk(out1,k)
-        top2= torch.topk(out2,k)
+    pred1 = [(celeba_attrs[i], float(out1[i])) for i in top1.indices]
+    pred2 = [(celeba_attrs[i], float(out2[i])) for i in top2.indices]
 
-        self.pred1 = [(celeba_attrs[i], float(out1[i])) for i in top1.indices]
-        self.pred2 = [(celeba_attrs[i], float(out2[i])) for i in top2.indices]
+    return pred1, pred2, image
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+# ------------------- Mode Selection -------------------
+mode = st.radio("Choose input method:", ["Upload Image", "Use Webcam"])
 
-# ------------------- Start Webcam -------------------
-ctx = webrtc_streamer(
-    key="celeba-cam",
-    mode=WebRtcMode.SENDRECV,
-    video_processor_factory=VideoProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True
-)
-if ctx and ctx.state.playing and ctx.video_processor:
-    ctx.video_processor.top_k = top_k
+# ------------------- Webcam Option -------------------
+if mode == "Use Webcam":
+    class VideoProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.pred1 = []
+            self.pred2 = []
 
-# ------------------- Sidebar Display -------------------
-st_autorefresh(interval=2000, key="refresh_sidebar")
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            input_tensor = transform(img_rgb).unsqueeze(0)
 
-if ctx and ctx.video_processor:
-    st.sidebar.subheader("Model 1 Predictions")
-    for attr, conf in ctx.video_processor.pred1:
-        st.sidebar.write(f"{attr}: {conf:.2f}")
+            with torch.no_grad():
+                out1 = torch.sigmoid(model1(input_tensor))[0]
+                out2 = torch.sigmoid(model2(input_tensor))[0]
 
-    st.sidebar.subheader("Model 2 Predictions")
-    for attr, conf in ctx.video_processor.pred2:
-        st.sidebar.write(f"{attr}: {conf:.2f}")
+            top1 = torch.topk(out1, top_k)
+            top2 = torch.topk(out2, top_k)
+
+            self.pred1 = [(celeba_attrs[i], float(out1[i])) for i in top1.indices]
+            self.pred2 = [(celeba_attrs[i], float(out2[i])) for i in top2.indices]
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    ctx = webrtc_streamer(
+        key="celeba-cam",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True
+    )
+
+    st_autorefresh(interval=2000, key="refresh_sidebar")
+
+    if ctx and ctx.state.playing and ctx.video_processor:
+        st.sidebar.subheader("Model 1 Predictions")
+        for attr, conf in ctx.video_processor.pred1:
+            st.sidebar.write(f"{attr}: {conf:.2f}")
+
+        st.sidebar.subheader("Model 2 Predictions")
+        for attr, conf in ctx.video_processor.pred2:
+            st.sidebar.write(f"{attr}: {conf:.2f}")
+
+    else:
+        st.sidebar.write("Waiting for webcam...")
+
+# ------------------- Upload Option -------------------
 else:
-    st.sidebar.write("Waiting for webcam to start...")
+    uploaded_file = st.file_uploader("Upload a face image", type=["jpg", "jpeg", "png"])
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Uploaded Image", use_column_width=True)
+
+        pred1, pred2, _ = predict_attributes(image)
+
+        st.subheader("Model 1 Predictions")
+        for attr, conf in pred1:
+            st.write(f"{attr}: {conf:.2f}")
+
+        st.subheader("Model 2 Predictions")
+        for attr, conf in pred2:
+            st.write(f"{attr}: {conf:.2f}")
